@@ -1,0 +1,40 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: bgzf-audit:latest
+    # Host-side published port is configurable through the HOST_PORT
+    # environment variable (defaults to 8080). PORT overrides the
+    # in-container listening port if needed.
+    ports:
+      - "${HOST_PORT:-8080}:${PORT:-8080}"
+    environment:
+      PORT: "${PORT:-8080}"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import os,sys,urllib.request;port=os.environ.get('PORT','8080');sys.exit(0 if urllib.request.urlopen(f'http://127.0.0.1:{port}/healthz',timeout=2).status==200 else 1)"
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 3s
+    restart: unless-stopped
+
+  # One-off verification job: waits until app is healthy, then runs the
+  # build check, the test suite and the CRC / block-size / index-drift
+  # smoke samples, exiting non-zero if anything fails.
+  verify:
+    image: bgzf-audit:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      APP_URL: "http://app:${PORT:-8080}"
+    command: ["python", "scripts/verify.py"]
+    restart: "no"
