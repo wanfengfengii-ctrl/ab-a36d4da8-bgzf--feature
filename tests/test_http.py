@@ -45,6 +45,21 @@ class HttpServerTestBase(unittest.TestCase):
         conn.close()
         return resp.status, json.loads(data) if data else None
 
+    def post_reindex(self, fields):
+        body, ct = encode_multipart(fields)
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        conn.request(
+            "POST",
+            "/api/bgzf/reindex",
+            body=body,
+            headers={"Content-Type": ct, "Content-Length": str(len(body))},
+        )
+        resp = conn.getresponse()
+        data = resp.read()
+        headers = {k.lower(): v for k, v in resp.getheaders()}
+        conn.close()
+        return resp.status, headers, data
+
     def get(self, path):
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
         conn.request("GET", path)
@@ -146,6 +161,101 @@ class AuditEndpointTests(HttpServerTestBase):
         self.assertEqual(set(payload["error"].keys()), {"code", "message", "offset"})
         self.assertEqual(payload["error"]["code"], "BAD_MAGIC")
         self.assertEqual(payload["error"]["offset"], 0)
+
+
+class ReindexEndpointTests(HttpServerTestBase):
+    def test_rebuilds_index_then_round_trips_through_audit(self):
+        import hashlib
+
+        from app.bgzf import audit
+
+        payloads = [b"reindex-zero", b"reindex-one", b"reindex-two"]
+        archive = build_archive(payloads)
+        status, headers, data = self.post_reindex(
+            {"archive": ("a.bgz", archive)}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["content-type"], "application/octet-stream")
+        expected_index = build_index(archive, payloads)
+        self.assertEqual(data, expected_index)
+        self.assertEqual(headers["content-length"], str(len(expected_index)))
+        self.assertEqual(headers["x-bgzf-block-count"], "3")
+        self.assertEqual(
+            headers["x-bgzf-uncompressed-length"], str(sum(map(len, payloads)))
+        )
+        stream = b"".join(payloads)
+        self.assertEqual(headers["x-bgzf-sha256"], hashlib.sha256(stream).hexdigest())
+
+        # The rebuilt index is immediately usable by the audit endpoint.
+        status2, body2 = self.post_audit(
+            {"archive": ("a.bgz", archive), "index": ("a.gzi", data)}
+        )
+        self.assertEqual(status2, 200, body2)
+        self.assertEqual(body2["data_blocks"], 3)
+        self.assertEqual(body2["sha256"], headers["x-bgzf-sha256"])
+        self.assertEqual(audit(archive, data).sha256, headers["x-bgzf-sha256"])
+
+    def test_single_block_yields_zero_count_index(self):
+        archive = build_archive([b"solo"])
+        status, headers, data = self.post_reindex(
+            {"archive": ("a.bgz", archive)}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(data, struct.pack("<Q", 0))
+        self.assertEqual(headers["x-bgzf-block-count"], "1")
+        self.assertEqual(headers["x-bgzf-uncompressed-length"], "4")
+        status2, body2 = self.post_audit(
+            {"archive": ("a.bgz", archive), "index": ("a.gzi", data)}
+        )
+        self.assertEqual(status2, 200, body2)
+
+    def test_corrupt_archive_rejected_without_partial_index(self):
+        payloads = [b"aaaa", b"bbbb"]
+        archive = bytearray(build_archive(payloads))
+        first_len = len(bgzf_block(b"aaaa"))
+        struct.pack_into("<I", archive, first_len - 8, 0xDEADBEEF)
+        status, headers, data = self.post_reindex(
+            {"archive": ("a.bgz", bytes(archive))}
+        )
+        self.assertEqual(status, 422)
+        self.assertEqual(headers["content-type"], "application/json")
+        body = json.loads(data)
+        self.assertEqual(body["error"]["code"], "CRC32_MISMATCH")
+        self.assertEqual(body["error"]["offset"], first_len - 8)
+        # No index framing may leak into a JSON error body.
+        self.assertNotIn("x-bgzf-block-count", headers)
+
+    def test_garbage_archive_rejected_with_stable_offset(self):
+        status, headers, data = self.post_reindex(
+            {"archive": ("a.bgz", b"garbage")}
+        )
+        self.assertEqual(status, 422)
+        body = json.loads(data)
+        self.assertEqual(body["error"]["code"], "BAD_MAGIC")
+        self.assertEqual(body["error"]["offset"], 0)
+        self.assertNotIn("x-bgzf-block-count", headers)
+
+    def test_missing_archive_part(self):
+        status, _headers, data = self.post_reindex(
+            {"other": ("a.gzi", struct.pack("<Q", 0))}
+        )
+        self.assertEqual(status, 422)
+        body = json.loads(data)
+        self.assertEqual(body["error"]["code"], "MISSING_PART")
+
+    def test_wrong_content_type(self):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        conn.request(
+            "POST",
+            "/api/bgzf/reindex",
+            body=b"{}",
+            headers={"Content-Type": "application/json"},
+        )
+        resp = conn.getresponse()
+        body = json.loads(resp.read())
+        conn.close()
+        self.assertEqual(resp.status, 415)
+        self.assertEqual(body["error"]["code"], "UNSUPPORTED_MEDIA_TYPE")
 
 
 if __name__ == "__main__":

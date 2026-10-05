@@ -24,8 +24,10 @@ services:
     restart: unless-stopped
 
   # One-off verification job: waits until app is healthy, then runs the
-  # build check, the test suite and the CRC / block-size / index-drift
-  # smoke samples, exiting non-zero if anything fails.
+  # build check, the test suite and the audit smoke samples (CRC /
+  # block-size / index-drift) plus the reindex business smokes (rebuilt
+  # index round-trips audit; corrupted archive is rejected), exiting
+  # non-zero if anything fails.
   verify:
     image: bgzf-audit:latest
     build:

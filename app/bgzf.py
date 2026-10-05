@@ -207,11 +207,14 @@ def _parse_bgzf_member(data: bytes, start: int) -> tuple[int, bytes, int]:
     return member_end, payload, isize_stored
 
 
-def audit(archive: bytes, index: bytes) -> AuditResult:
-    """Validate a BGZF archive together with its companion block index.
+def _validate_archive(archive: bytes) -> list[tuple[int, int, bytes]]:
+    """Validate every structural aspect of an archive that does not need an
+    index: size limits, member headers/Deflate/CRC32/ISIZE, the EOF layout
+    and the data-block count.
 
-    Raises :class:`AuditError` on the first problem, positioned at the
-    first locatable compressed offset.
+    Returns ``(start, end, payload)`` for each data block (every member
+    except the terminal EOF sentinel).  Raises :class:`AuditError` on the
+    first problem, positioned at the first locatable compressed offset.
     """
     if len(archive) > MAX_ARCHIVE_SIZE:
         raise AuditError(
@@ -222,7 +225,8 @@ def audit(archive: bytes, index: bytes) -> AuditResult:
     if not archive:
         raise AuditError("EMPTY_ARCHIVE", "archive is empty", 0)
 
-    # Parse every member first, recording payloads and offsets.
+    # Parse every member first, recording payloads and offsets.  Member,
+    # Deflate, CRC32 and ISIZE validation all happens here.
     members: list[tuple[int, int, bytes]] = []  # (start, end, payload)
     pos = 0
     while pos < len(archive):
@@ -263,20 +267,53 @@ def audit(archive: bytes, index: bytes) -> AuditResult:
             data_members[MAX_DATA_BLOCKS][0],
         )
 
-    _audit_index(index, data_members)
+    return data_members
 
-    # Everything is consistent: assemble the decompressed stream.
+
+def _summarize(data_members: list[tuple[int, int, bytes]]) -> AuditResult:
+    """Concatenate the verified payloads into the audit summary."""
     digest = hashlib.sha256()
     total = 0
     for _start, _end, payload in data_members:
         digest.update(payload)
         total += len(payload)
-
     return AuditResult(
         data_blocks=len(data_members),
         uncompressed_length=total,
         sha256=digest.hexdigest(),
     )
+
+
+def audit(archive: bytes, index: bytes) -> AuditResult:
+    """Validate a BGZF archive together with its companion block index.
+
+    Raises :class:`AuditError` on the first problem, positioned at the
+    first locatable compressed offset.
+    """
+    data_members = _validate_archive(archive)
+    _audit_index(index, data_members)
+    return _summarize(data_members)
+
+
+def reindex(archive: bytes) -> tuple[bytes, AuditResult]:
+    """Rebuild the companion block index for a trusted, valid archive.
+
+    Every member, the EOF sentinel, every Deflate stream, CRC32 and ISIZE
+    are verified before a single index byte is produced, so a failure can
+    never surface alongside a partial index.  Returns the little-endian
+    index body and the :class:`AuditResult` summary; a single-data-block
+    archive yields a legal index whose only content is an eight-byte zero
+    count.
+    """
+    data_members = _validate_archive(archive)
+    result = _summarize(data_members)
+
+    entries = [struct.pack("<Q", len(data_members) - 1)]
+    cumulative = len(data_members[0][2])
+    for start, _end, payload in data_members[1:]:
+        entries.append(struct.pack("<QQ", start, cumulative))
+        cumulative += len(payload)
+    return b"".join(entries), result
 
 
 def _audit_index(index: bytes, data_members: list[tuple[int, int, bytes]]) -> None:

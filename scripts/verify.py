@@ -5,9 +5,12 @@ It waits for the application health endpoint, then:
 
 1. runs a build check (byte-compilation of every module);
 2. runs the unittest suite (code + HTTP-level tests);
-3. submits four smoke samples to ``POST /api/bgzf/audit``:
+3. submits smoke samples to ``POST /api/bgzf/audit``:
    a valid archive, a CRC32-corrupted member, a declared block-size
-   drift, and an index offset mismatch.
+   drift, and an index offset mismatch;
+4. submits two business smokes to ``POST /api/bgzf/reindex``: a valid
+   archive whose rebuilt index is sent back to the audit endpoint, and a
+   corrupted archive that must be rejected.
 
 Exits 0 only when every stage passes; exits 1 with a readable report
 otherwise, so Compose marks the one-off service as failed.
@@ -155,6 +158,69 @@ def smoke_index_drift():
     assert status == 422, f"expected 422, got {status}: {body}"
     assert body["error"]["code"] == "INDEX_COMPRESSED_OFFSET_MISMATCH"
     assert body["error"]["offset"] == len(bgzf_block(payloads[0]))
+    return f"422 {body['error']['code']} at offset {body['error']['offset']}"
+
+
+def post_reindex(archive: bytes) -> tuple[int, dict, bytes, dict[str, str]]:
+    body, content_type = encode_multipart(
+        {"archive": ("sample.bgz", archive)}
+    )
+    req = urllib.request.Request(
+        f"{APP_URL}/api/bgzf/reindex",
+        data=body,
+        headers={"Content-Type": content_type, "Content-Length": str(len(body))},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            headers = {k.lower(): v for k, v in resp.getheaders()}
+            return resp.status, {}, resp.read(), headers
+    except urllib.error.HTTPError as exc:
+        headers = {k.lower(): v for k, v in exc.headers.items()}
+        return exc.code, json.loads(exc.read()), b"", headers
+
+
+@smoke("reindex rebuilt index round-trips audit")
+def smoke_reindex_roundtrip():
+    import hashlib
+
+    payloads = [b"rebuild-alpha", b"rebuild-beta!", b"rebuild-gamma?"]
+    archive = build_archive(payloads)
+    status, _error, index, headers = post_reindex(archive)
+    assert status == 200, f"expected 200, got {status}"
+    assert headers.get("content-type") == "application/octet-stream"
+    assert headers.get("x-bgzf-block-count") == str(len(payloads))
+    total = sum(map(len, payloads))
+    assert headers.get("x-bgzf-uncompressed-length") == str(total)
+    expected_sha = hashlib.sha256(b"".join(payloads)).hexdigest()
+    assert headers.get("x-bgzf-sha256") == expected_sha
+    assert index == build_index(archive, payloads)
+
+    # Send the rebuilt index straight back to the audit endpoint.
+    audit_status, audit_body = post_audit(archive, index)
+    assert audit_status == 200, f"expected 200, got {audit_status}: {audit_body}"
+    assert audit_body["data_blocks"] == len(payloads)
+    assert audit_body["uncompressed_length"] == total
+    assert audit_body["sha256"] == expected_sha
+    return (
+        f"{len(payloads)} blocks, {total} bytes, "
+        f"rebuilt {len(index)}-byte index, audit 200"
+    )
+
+
+@smoke("reindex rejects corrupted archive")
+def smoke_reindex_corrupt():
+    payloads = [b"reindex-good", b"reindex-bad"]
+    archive = bytearray(build_archive(payloads))
+    first_len = len(bgzf_block(payloads[0]))
+    struct.pack_into("<I", archive, first_len - 8, 0xDEADBEEF)
+    status, body, index_bytes, headers = post_reindex(bytes(archive))
+    assert status == 422, f"expected 422, got {status}: {body}"
+    assert body["error"]["code"] == "CRC32_MISMATCH"
+    assert body["error"]["offset"] == first_len - 8
+    # An error must never carry index framing or an index body.
+    assert "x-bgzf-block-count" not in headers
+    assert index_bytes == b""
     return f"422 {body['error']['code']} at offset {body['error']['offset']}"
 
 

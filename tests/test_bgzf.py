@@ -17,6 +17,7 @@ from app.bgzf import (  # noqa: E402
     MAX_DATA_BLOCKS,
     AuditError,
     audit,
+    reindex,
 )
 from tests.bgzf_fixtures import bgzf_block, build_archive, build_index  # noqa: E402
 
@@ -253,6 +254,59 @@ class IndexFailureTests(unittest.TestCase):
         self.assertEqual(result.data_blocks, 1)
         # Nonzero count for one block is invalid
         self.expect(struct.pack("<Q", 1) + b"\x00" * 16, "INDEX_COUNT_MISMATCH")
+
+
+class ReindexTests(unittest.TestCase):
+    def test_rebuilds_canonical_index(self):
+        payloads = [b"block-zero", b"block-one", b"block-two"]
+        archive = build_archive(payloads)
+        index, result = reindex(archive)
+        self.assertEqual(index, build_index(archive, payloads))
+        self.assertEqual(result, audit(archive, index))
+        self.assertEqual(result.data_blocks, 3)
+        self.assertEqual(result.uncompressed_length, sum(map(len, payloads)))
+        self.assertEqual(
+            result.sha256, hashlib.sha256(b"".join(payloads)).hexdigest()
+        )
+
+    def test_single_block_yields_zero_count_index(self):
+        archive = build_archive([b"lone-block"])
+        index, result = reindex(archive)
+        self.assertEqual(index, struct.pack("<Q", 0))
+        self.assertEqual(len(index), 8)
+        # The rebuilt index is immediately usable for a full audit.
+        self.assertEqual(audit(archive, index), result)
+        self.assertEqual(result.data_blocks, 1)
+
+    def test_many_blocks_offsets(self):
+        payloads = [bytes([65 + (i % 26)]) * (i + 1) for i in range(60)]
+        archive = build_archive(payloads)
+        index, result = reindex(archive)
+        self.assertEqual(index, build_index(archive, payloads))
+        self.assertEqual(result, audit(archive, index))
+
+    def test_corruption_is_rejected_before_index_bytes(self):
+        payloads = [b"aaaa", b"bbbb"]
+        archive = bytearray(build_archive(payloads))
+        first_len = len(bgzf_block(b"aaaa"))
+        struct.pack_into("<I", archive, first_len - 8, 0xDEADBEEF)
+        with self.assertRaises(AuditError) as ctx:
+            reindex(bytes(archive))
+        self.assertEqual(ctx.exception.code, "CRC32_MISMATCH")
+        self.assertEqual(ctx.exception.offset, first_len - 8)
+
+    def test_missing_eof_is_rejected(self):
+        archive = build_archive([b"aaaa", b"bbbb"], eof=False)
+        with self.assertRaises(AuditError) as ctx:
+            reindex(archive)
+        self.assertEqual(ctx.exception.code, "MISSING_EOF_MEMBER")
+
+    def test_too_many_blocks_is_rejected(self):
+        payloads = [b"x"] * (MAX_DATA_BLOCKS + 1)
+        archive = build_archive(payloads)
+        with self.assertRaises(AuditError) as ctx:
+            reindex(archive)
+        self.assertEqual(ctx.exception.code, "TOO_MANY_BLOCKS")
 
 
 if __name__ == "__main__":
