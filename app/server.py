@@ -2,9 +2,11 @@
 
 Exposes:
 
-* ``POST /api/bgzf/audit`` -- multipart/form-data with ``archive`` and
+* ``POST /api/bgzf/audit``   -- multipart/form-data with ``archive`` and
   ``index`` file parts.
-* ``GET  /healthz``        -- liveness probe for the container health
+* ``POST /api/bgzf/reindex`` -- multipart/form-data with a single
+  ``archive`` part; returns a rebuilt little-endian index body.
+* ``GET  /healthz``          -- liveness probe for the container health
   check.
 
 Only the Python standard library is required.
@@ -17,11 +19,14 @@ import os
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from .bgzf import MAX_ARCHIVE_SIZE, AuditError, audit
+from .bgzf import MAX_ARCHIVE_SIZE, AuditError, audit, reindex
 
 # The index for 4096 blocks is ~64 KiB; allow generous multipart framing
 # overhead on top of the 8 MiB archive limit.
 MAX_REQUEST_SIZE = MAX_ARCHIVE_SIZE + 256 * 1024
+
+AUDIT_PATH = "/api/bgzf/audit"
+REINDEX_PATH = "/api/bgzf/reindex"
 
 
 class MultipartError(Exception):
@@ -114,13 +119,24 @@ class AuditHandler(BaseHTTPRequestHandler):
             )
 
     def do_POST(self) -> None:  # noqa: N802 - http.server hook
-        if self.path.split("?", 1)[0] != "/api/bgzf/audit":
+        path = self.path.split("?", 1)[0]
+        if path == AUDIT_PATH:
+            self._handle_audit()
+        elif path == REINDEX_PATH:
+            self._handle_reindex()
+        else:
             self._write_json(
                 HTTPStatus.NOT_FOUND,
                 {"error": {"code": "NOT_FOUND", "message": "unknown path", "offset": None}},
             )
-            return
 
+    def _read_parts(self, required: tuple[str, ...]) -> dict[str, bytes] | None:
+        """Read and parse a multipart request body, or send an error.
+
+        Returns the parsed parts, or ``None`` after writing the error
+        response when the transport or multipart framing is invalid or a
+        required part is missing.
+        """
         content_type = self.headers.get("Content-Type", "")
         if not content_type.lower().startswith("multipart/form-data"):
             self._write_json(
@@ -133,7 +149,7 @@ class AuditHandler(BaseHTTPRequestHandler):
                     }
                 },
             )
-            return
+            return None
 
         try:
             length = int(self.headers.get("Content-Length", "0"))
@@ -144,7 +160,7 @@ class AuditHandler(BaseHTTPRequestHandler):
                 HTTPStatus.LENGTH_REQUIRED,
                 {"error": {"code": "BAD_CONTENT_LENGTH", "message": "invalid Content-Length", "offset": None}},
             )
-            return
+            return None
         if length > MAX_REQUEST_SIZE:
             # Drain a modestly oversized body so the uploader still reads
             # the 413 cleanly; refuse to tie up a thread draining a body
@@ -161,7 +177,7 @@ class AuditHandler(BaseHTTPRequestHandler):
                     }
                 },
             )
-            return
+            return None
 
         body = self._read_exactly(length)
         if body is None:
@@ -169,7 +185,7 @@ class AuditHandler(BaseHTTPRequestHandler):
                 HTTPStatus.BAD_REQUEST,
                 {"error": {"code": "TRUNCATED_REQUEST", "message": "request body shorter than Content-Length", "offset": None}},
             )
-            return
+            return None
 
         try:
             parts = parse_multipart(body, content_type)
@@ -178,9 +194,9 @@ class AuditHandler(BaseHTTPRequestHandler):
                 HTTPStatus.UNPROCESSABLE_ENTITY,
                 {"error": {"code": "MALFORMED_MULTIPART", "message": str(exc), "offset": None}},
             )
-            return
+            return None
 
-        missing = [name for name in ("archive", "index") if name not in parts]
+        missing = [name for name in required if name not in parts]
         if missing:
             self._write_json(
                 HTTPStatus.UNPROCESSABLE_ENTITY,
@@ -192,28 +208,37 @@ class AuditHandler(BaseHTTPRequestHandler):
                     }
                 },
             )
+            return None
+        return parts
+
+    def _write_audit_error(self, exc: AuditError) -> None:
+        # Size is a transport-level rejection; everything else is a
+        # semantic 422 with a stable, locatable error code.
+        status = (
+            HTTPStatus.REQUEST_ENTITY_TOO_LARGE
+            if exc.code == "ARCHIVE_TOO_LARGE"
+            else HTTPStatus.UNPROCESSABLE_ENTITY
+        )
+        self._write_json(
+            status,
+            {
+                "error": {
+                    "code": exc.code,
+                    "message": str(exc),
+                    "offset": exc.offset,
+                }
+            },
+        )
+
+    def _handle_audit(self) -> None:
+        parts = self._read_parts(("archive", "index"))
+        if parts is None:
             return
 
         try:
             result = audit(parts["archive"], parts["index"])
         except AuditError as exc:
-            # Size is a transport-level rejection; everything else is a
-            # semantic 422 with a stable, locatable error code.
-            status = (
-                HTTPStatus.REQUEST_ENTITY_TOO_LARGE
-                if exc.code == "ARCHIVE_TOO_LARGE"
-                else HTTPStatus.UNPROCESSABLE_ENTITY
-            )
-            self._write_json(
-                status,
-                {
-                    "error": {
-                        "code": exc.code,
-                        "message": str(exc),
-                        "offset": exc.offset,
-                    }
-                },
-            )
+            self._write_audit_error(exc)
             return
 
         self._write_json(
@@ -224,6 +249,30 @@ class AuditHandler(BaseHTTPRequestHandler):
                 "sha256": result.sha256,
             },
         )
+
+    def _handle_reindex(self) -> None:
+        parts = self._read_parts(("archive",))
+        if parts is None:
+            return
+
+        # reindex verifies every member, EOF, Deflate stream, CRC32 and
+        # ISIZE before it returns a single index byte, so a failure here
+        # carries the same stable code / offset as the audit endpoint and
+        # is never accompanied by a partial index body.
+        try:
+            index, result = reindex(parts["archive"])
+        except AuditError as exc:
+            self._write_audit_error(exc)
+            return
+
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(len(index)))
+        self.send_header("X-BGZF-Data-Blocks", str(result.data_blocks))
+        self.send_header("X-BGZF-Uncompressed-Length", str(result.uncompressed_length))
+        self.send_header("X-BGZF-SHA256", result.sha256)
+        self.end_headers()
+        self.wfile.write(index)
 
     def _drain_best_effort(self, length: int) -> None:
         """Discard up to ``length`` request bytes without storing them."""

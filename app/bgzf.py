@@ -15,6 +15,11 @@ The companion index is a little-endian unsigned 64-bit structure::
 with one entry for every data block except the first, recording the
 block's compressed-file offset and the cumulative decompressed offset at
 which its payload begins.
+
+Archives can be audited against a supplied index (:func:`audit`) or,
+when the index has been lost, rebuilt from a trusted archive
+(:func:`reindex`).  Rebuilding never recompresses anything: it only
+re-reads and verifies every member and serialises the offsets it found.
 """
 
 from __future__ import annotations
@@ -207,9 +212,14 @@ def _parse_bgzf_member(data: bytes, start: int) -> tuple[int, bytes, int]:
     return member_end, payload, isize_stored
 
 
-def audit(archive: bytes, index: bytes) -> AuditResult:
-    """Validate a BGZF archive together with its companion block index.
+def _parse_archive(archive: bytes) -> list[tuple[int, int, bytes]]:
+    """Validate the archive itself and return its data members.
 
+    Every member is parsed (gzip header, BC field, Deflate boundary,
+    CRC32 and ISIZE), the canonical EOF sentinel is checked at the end
+    (and nowhere in the data region), and the data-block limit is
+    enforced.  On success returns ``(start, end, payload)`` tuples for
+    the data blocks, i.e. all members except the trailing EOF block.
     Raises :class:`AuditError` on the first problem, positioned at the
     first locatable compressed offset.
     """
@@ -263,9 +273,46 @@ def audit(archive: bytes, index: bytes) -> AuditResult:
             data_members[MAX_DATA_BLOCKS][0],
         )
 
-    _audit_index(index, data_members)
+    return data_members
 
-    # Everything is consistent: assemble the decompressed stream.
+
+def audit(archive: bytes, index: bytes) -> AuditResult:
+    """Validate a BGZF archive together with its companion block index.
+
+    Raises :class:`AuditError` on the first problem, positioned at the
+    first locatable compressed offset.
+    """
+    data_members = _parse_archive(archive)
+    _audit_index(index, data_members)
+    return _summarise(data_members)
+
+
+def reindex(archive: bytes) -> tuple[bytes, AuditResult]:
+    """Rebuild the companion index for a trusted, index-less archive.
+
+    The archive undergoes exactly the same member, EOF, Deflate, CRC32
+    and ISIZE checks as :func:`audit`; no index bytes are produced until
+    all of them have passed.  Returns ``(index, result)`` where ``index``
+    is the little-endian index body (count followed by one
+    compressed-start / cumulative-uncompressed-start pair per non-first
+    data block).  A single-block archive yields a legal eight-byte index
+    carrying a zero count.
+    """
+    data_members = _parse_archive(archive)
+
+    # All verification has succeeded: serialise the offsets observed
+    # while parsing, without recompressing anything.
+    parts = [struct.pack("<Q", len(data_members) - 1)]
+    cumulative = len(data_members[0][2])
+    for start, _end, payload in data_members[1:]:
+        parts.append(struct.pack("<QQ", start, cumulative))
+        cumulative += len(payload)
+
+    return b"".join(parts), _summarise(data_members)
+
+
+def _summarise(data_members: list[tuple[int, int, bytes]]) -> AuditResult:
+    """Digest and length of the concatenated decompressed payloads."""
     digest = hashlib.sha256()
     total = 0
     for _start, _end, payload in data_members:

@@ -17,6 +17,7 @@ from app.bgzf import (  # noqa: E402
     MAX_DATA_BLOCKS,
     AuditError,
     audit,
+    reindex,
 )
 from tests.bgzf_fixtures import bgzf_block, build_archive, build_index  # noqa: E402
 
@@ -253,6 +254,91 @@ class IndexFailureTests(unittest.TestCase):
         self.assertEqual(result.data_blocks, 1)
         # Nonzero count for one block is invalid
         self.expect(struct.pack("<Q", 1) + b"\x00" * 16, "INDEX_COUNT_MISMATCH")
+
+
+class ReindexTests(unittest.TestCase):
+    def expect_fail(self, archive, code, offset=None):
+        with self.assertRaises(AuditError) as ctx:
+            reindex(archive)
+        self.assertEqual(ctx.exception.code, code)
+        if offset is not None:
+            self.assertEqual(ctx.exception.offset, offset)
+        return ctx.exception
+
+    def test_single_block_produces_zero_count_index(self):
+        payloads = [b"hello bgzf"]
+        archive = build_archive(payloads)
+        index, result = reindex(archive)
+        self.assertEqual(index, struct.pack("<Q", 0))
+        self.assertEqual(len(index), 8)
+        self.assertEqual(result.data_blocks, 1)
+        self.assertEqual(result.uncompressed_length, 10)
+        self.assertEqual(result.sha256, hashlib.sha256(payloads[0]).hexdigest())
+        # The rebuilt index must satisfy the regular audit path.
+        self.assertEqual(audit(archive, index).data_blocks, 1)
+
+    def test_many_blocks_matches_canonical_index(self):
+        payloads = [b"x" * (i + 1) for i in range(50)]
+        payloads[7] = b"chunk-eight"
+        archive = build_archive(payloads)
+        index, result = reindex(archive)
+        self.assertEqual(index, build_index(archive, payloads))
+
+        count = struct.unpack_from("<Q", index, 0)[0]
+        self.assertEqual(count, len(payloads) - 1)
+        stream = b"".join(payloads)
+        self.assertEqual(result.data_blocks, len(payloads))
+        self.assertEqual(result.uncompressed_length, len(stream))
+        self.assertEqual(result.sha256, hashlib.sha256(stream).hexdigest())
+        # Round-trip: the rebuilt index passes a full audit.
+        audit(archive, index)
+
+    def test_entries_are_little_endian_offset_pairs(self):
+        payloads = [b"aaaa", b"bbbb", b"cccc"]
+        archive = build_archive(payloads)
+        index, _result = reindex(archive)
+        first_len = len(bgzf_block(b"aaaa"))
+        second_len = len(bgzf_block(b"bbbb"))
+        self.assertEqual(
+            index,
+            struct.pack("<Q", 2)
+            + struct.pack("<QQ", first_len, 4)
+            + struct.pack("<QQ", first_len + second_len, 8),
+        )
+
+    def test_empty_archive_rejected(self):
+        self.expect_fail(b"", "EMPTY_ARCHIVE", 0)
+
+    def test_crc_corruption_rejected_before_index(self):
+        payloads = [b"aaaa", b"bbbb"]
+        archive = bytearray(build_archive(payloads))
+        first_len = len(bgzf_block(b"aaaa"))
+        struct.pack_into("<I", archive, first_len - 8, 0xDEADBEEF)
+        self.expect_fail(bytes(archive), "CRC32_MISMATCH", first_len - 8)
+
+    def test_bad_deflate_rejected(self):
+        payloads = [b"aaaa", b"bbbb"]
+        archive = bytearray(build_archive(payloads))
+        archive[18] ^= 0xFF
+        with self.assertRaises(AuditError) as ctx:
+            reindex(bytes(archive))
+        self.assertIn(ctx.exception.code, {"BAD_DEFLATE", "DEFLATE_NOT_TERMINATED", "CRC32_MISMATCH"})
+
+    def test_missing_eof_rejected(self):
+        payloads = [b"aaaa"]
+        archive = build_archive(payloads)[: -len(EOF_MEMBER)]
+        self.expect_fail(archive, "MISSING_EOF_MEMBER")
+
+    def test_too_many_blocks_rejected(self):
+        payloads = [b"x"] * (MAX_DATA_BLOCKS + 1)
+        self.expect_fail(build_archive(payloads), "TOO_MANY_BLOCKS")
+
+    def test_archive_too_large_rejected(self):
+        self.expect_fail(os.urandom(MAX_ARCHIVE_SIZE + 10), "ARCHIVE_TOO_LARGE")
+
+    def test_eof_in_data_region_rejected(self):
+        injected = bgzf_block(b"aaaa") + EOF_MEMBER + bgzf_block(b"bbbb") + EOF_MEMBER
+        self.expect_fail(injected, "UNEXPECTED_EOF_MEMBER")
 
 
 if __name__ == "__main__":
